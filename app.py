@@ -446,10 +446,44 @@ def run_factory_script(filename, *args):
         return -1
 
 
+# ── Hero 키워드 필터링용 키워드 사전 ───────────────────────────────────
+# 정치 기사(정당·선거·외교·정부 인사 등)는 법률 콘텐츠로 풀기 어렵고
+# 민감하므로 크롤링 후보에서 제외합니다.
+POLITICAL_KEYWORDS = [
+    "대통령", "대통령실", "청와대", "대선", "총선", "지방선거", "보궐선거", "선거",
+    "여당", "야당", "정당", "민주당", "국민의힘", "조국혁신당", "개혁신당",
+    "국회", "의원", "원내대표", "당대표", "공천", "탄핵", "개헌", "지지율",
+    "장관", "차관", "개각", "인사청문", "정부", "외교", "정상회담", "북한", "미사일",
+    "여야", "친윤", "친명", "정치", "표결", "국정감사", "국정조사", "예산안",
+]
+
+# 법률적으로 풀어낼 수 있는 사건·분쟁 관련 키워드 (하나라도 포함되면 우선 채택)
+LEGAL_KEYWORDS = [
+    "고소", "고발", "소송", "재판", "판결", "선고", "기소", "구속", "체포", "압수수색",
+    "검찰", "경찰", "법원", "변호사", "혐의", "피의자", "피해자", "가해자", "용의자",
+    "처벌", "징역", "벌금", "실형", "집행유예", "항소", "상고", "유죄", "무죄",
+    "사기", "횡령", "배임", "폭행", "상해", "절도", "강도", "협박", "감금", "살인",
+    "성범죄", "성폭력", "성추행", "불법촬영", "스토킹", "음주운전", "뺑소니",
+    "명예훼손", "모욕", "무고", "위증", "손해배상", "배상", "합의", "위자료",
+    "상속", "이혼", "친권", "양육", "계약", "임대차", "전세사기", "보이스피싱",
+    "학교폭력", "직장내괴롭힘", "산업재해", "위반", "불법", "적발", "송치", "입건",
+]
+
+
+def _is_political(text: str) -> bool:
+    return any(kw in text for kw in POLITICAL_KEYWORDS)
+
+
+def _is_legal(text: str) -> bool:
+    return any(kw in text for kw in LEGAL_KEYWORDS)
+
+
 # ── Hero 키워드 후보 크롤링/생성 ────────────────────────────────────────
 def fetch_hero_candidates():
     """
-    네이버 뉴스 사건사고 섹션을 가볍게 크롤링하여 헤드라인 기반 키워드 3개를 반환.
+    네이버 뉴스 사회 섹션을 가볍게 크롤링하여 헤드라인 기반 키워드 3개를 반환.
+    - 정치 기사(정당·선거·외교 등)는 제외
+    - 법률적으로 풀어낼 수 있는 사건·분쟁 헤드라인만 우선 채택
     크롤링 실패 시 기본 후보를 반환.
     """
     fallback = [
@@ -470,13 +504,23 @@ def fetch_hero_candidates():
         if not titles:
             titles = re.findall(r'<strong[^>]*>([가-힣][^<]{5,35})</strong>', html)
 
-        headlines = list(dict.fromkeys([t.strip() for t in titles if len(t.strip()) >= 6]))[:8]
+        # 중복 제거 + 길이 필터
+        headlines = list(dict.fromkeys([t.strip() for t in titles if len(t.strip()) >= 6]))
 
-        if len(headlines) >= 3:
-            sampled = random.sample(headlines, 3)
-            return sampled
-        elif len(headlines) > 0:
-            return (headlines + fallback)[:3]
+        # 1) 정치 기사 제외
+        non_political = [h for h in headlines if not _is_political(h)]
+
+        # 2) 법률 사건 관련 헤드라인 우선 채택
+        legal_first = [h for h in non_political if _is_legal(h)]
+        # 3) 법률 후보가 3개 미만이면 비정치 헤드라인으로 보충
+        pool = list(dict.fromkeys(legal_first + non_political))[:8]
+
+        if len(pool) >= 3:
+            # 법률 관련 후보가 3개 이상이면 그 안에서, 아니면 pool에서 샘플
+            base = legal_first if len(legal_first) >= 3 else pool
+            return random.sample(base, 3)
+        elif len(pool) > 0:
+            return (pool + fallback)[:3]
         else:
             return fallback
     except Exception:
