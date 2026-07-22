@@ -66,26 +66,76 @@ def parse_volume(value) -> int:
         return 0
 
 
-def fetch_related_keywords(seed: str) -> list[dict]:
+def fetch_related_keywords(seed: str, max_retries: int = 3) -> list[dict]:
     uri = "/keywordstool"
     params = {"hintKeywords": seed, "showDetail": "1"}
-    headers = get_headers("GET", uri)
-    resp = requests.get(BASE_URL + uri, params=params, headers=headers, timeout=30)
-    resp.raise_for_status()
-    data = resp.json()
-    return data.get("keywordList", [])
+
+    last_err = None
+    for attempt in range(1, max_retries + 1):
+        # 재시도마다 새 서명/타임스탬프를 생성해야 인증 오류를 피할 수 있습니다.
+        headers = get_headers("GET", uri)
+        try:
+            resp = requests.get(
+                BASE_URL + uri,
+                params=params,
+                headers=headers,
+                # (연결 타임아웃, 읽기 타임아웃) - 읽기를 넉넉히 확보
+                timeout=(10, 60),
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return data.get("keywordList", [])
+        except requests.exceptions.Timeout as e:
+            last_err = e
+            wait = attempt * 2
+            print(f"  ~ 타임아웃(시도 {attempt}/{max_retries}) - {wait}초 후 재시도")
+            time.sleep(wait)
+        except requests.exceptions.ConnectionError as e:
+            last_err = e
+            wait = attempt * 2
+            print(f"  ~ 연결 실패(시도 {attempt}/{max_retries}) - {wait}초 후 재시도")
+            time.sleep(wait)
+
+    # 모든 재시도 실패 시 마지막 예외를 올려 호출부에서 처리
+    raise last_err
 
 
 def main():
+    # 🚨 [수정] 자격증명 누락 시 조용히 타임아웃/서명오류로 죽지 않도록 먼저 검증
+    missing = [
+        name
+        for name, val in (
+            ("NAVER_AD_ACCESS_KEY", API_KEY),
+            ("NAVER_AD_SECRET_KEY", SECRET_KEY),
+            ("NAVER_AD_CUSTOMER_ID", CUSTOMER_ID),
+        )
+        if not val
+    ]
+    if missing:
+        print(f"  ! 환경변수 누락: {', '.join(missing)}")
+        print("    Streamlit Secrets 또는 .env 에 네이버 검색광고 API 키를 등록하세요.")
+        return 1
+
     all_rows = []
     seen = set()
+    failed_seeds = []
 
-    for seed in SEED_KEYWORDS:
-        print(f"\n[수집] 시드 키워드: {seed}")
+    total_seeds = len(SEED_KEYWORDS)
+    for idx, seed in enumerate(SEED_KEYWORDS, start=1):
+        print(f"[{idx}/{total_seeds}] 시드 키워드 수집: {seed}")
         try:
             items = fetch_related_keywords(seed)
         except requests.HTTPError as e:
-            print(f"  ! API 오류: {e} - {e.response.text[:200]}")
+            body = ""
+            if e.response is not None:
+                body = e.response.text[:200]
+            print(f"  ! API 응답 오류: {e} - {body}")
+            failed_seeds.append(seed)
+            continue
+        except requests.exceptions.RequestException as e:
+            # 타임아웃/연결오류 등 네트워크 계열 예외를 모두 흡수 (스크립트 크래시 방지)
+            print(f"  ! 네트워크 오류로 '{seed}' 건너뜀: {type(e).__name__}")
+            failed_seeds.append(seed)
             continue
         print(f"  - 응답 키워드 수: {len(items)}")
 
@@ -116,6 +166,13 @@ def main():
         print(f"  - 1,500회 이상 통과: {kept}개")
         time.sleep(0.3)
 
+    # 🚨 [수정] 수집 결과가 하나도 없으면 기존 keywords.csv 를 빈 값으로 덮어쓰지 않음
+    if not all_rows:
+        print("  ! 수집된 키워드가 없습니다. 기존 keywords.csv 를 유지합니다.")
+        if failed_seeds:
+            print(f"    (실패한 시드: {', '.join(failed_seeds)})")
+        return 1
+
     all_rows.sort(key=lambda r: r["total_volume"], reverse=True)
 
     with open(OUTPUT_CSV, "w", newline="", encoding="utf-8-sig") as f:
@@ -145,4 +202,6 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+
+    sys.exit(main() or 0)
