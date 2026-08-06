@@ -327,8 +327,19 @@ def check_ssh_config():
 
 
 def _load_ssh_key(key_text: str, passphrase: str = None):
-    """PEM 형식 개인키 문자열을 키 종류(Ed25519/RSA/ECDSA/DSS) 자동판별하여 로드합니다."""
-    key_classes = [paramiko.Ed25519Key, paramiko.RSAKey, paramiko.ECDSAKey, paramiko.DSSKey]
+    """
+    PEM 형식 개인키 문자열을 키 종류(Ed25519/RSA/ECDSA) 자동판별하여 로드합니다.
+    DSSKey(DSA)는 paramiko 4.x부터 제거된 구식·취약 키 형식이라 제외합니다 —
+    getattr로 있을 때만 시도해 paramiko 버전이 달라도 AttributeError 없이 동작합니다.
+    """
+    key_classes = [
+        cls for cls in (
+            getattr(paramiko, "Ed25519Key", None),
+            getattr(paramiko, "RSAKey", None),
+            getattr(paramiko, "ECDSAKey", None),
+            getattr(paramiko, "DSSKey", None),
+        ) if cls is not None
+    ]
     last_err = None
     for cls in key_classes:
         try:
