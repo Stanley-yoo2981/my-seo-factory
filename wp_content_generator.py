@@ -248,7 +248,7 @@ def gen_dalle_image(prompt: str) -> bytes:
     )
     if resp.status_code != 200:
         raise RuntimeError(f"DALL-E 오류 {resp.status_code}: {resp.text[:300]}")
-    return base64.b64decode(resp.json()["data"][0]["b64_json"])
+    return base64.b64decode(safe_json(resp, "DALL-E")["data"][0]["b64_json"])
 
 
 def to_webp(png_bytes: bytes, out_path: str):
@@ -265,13 +265,79 @@ def wp_auth():
     return (WP_USERNAME, WP_PASSWORD)
 
 
+# 워드프레스/외부 API 공통 헤더 — Accept를 명시해야 일부 보안플러그인/WAF가
+# HTML 차단 페이지 대신 정상 JSON을 돌려줍니다.
+WP_COMMON_HEADERS = {
+    "Accept": "application/json",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+}
+
+
+def check_wp_config():
+    """WP 접속 정보 누락 시 조용히 HTML 로그인 페이지를 받아 JSON 파싱에서 죽는 것을 방지."""
+    missing = [
+        name for name, val in (
+            ("WP_URL", WP_URL),
+            ("WP_USERNAME", WP_USERNAME),
+            ("WP_PASSWORD", WP_PASSWORD),
+        ) if not val
+    ]
+    if missing:
+        raise RuntimeError(
+            f"워드프레스 환경변수 누락: {', '.join(missing)} — "
+            "Streamlit Secrets 또는 .env 에 등록하세요."
+        )
+
+
+def safe_json(r, label: str):
+    """
+    응답을 JSON으로 파싱하되, JSON이 아니면 원인을 알 수 있는 메시지로 바꿔 던집니다.
+    (기존에는 requests가 'Expecting value: line 1 column 1' 만 던져 원인 파악이 불가능했습니다.)
+    """
+    ctype = r.headers.get("Content-Type", "")
+    body = (r.text or "").strip()
+
+    try:
+        return r.json()
+    except ValueError:
+        pass
+
+    # 원인 진단 메시지 구성
+    hints = []
+    if r.history:
+        chain = " → ".join(str(h.status_code) for h in r.history)
+        hints.append(f"리다이렉트 발생({chain} → {r.url}) — WP_URL의 http/https·www 설정을 확인하세요")
+    if not body:
+        hints.append("응답 본문이 비어 있음 — 서버(PHP)가 요청을 중단했을 수 있습니다")
+    elif "text/html" in ctype or body[:1] == "<":
+        hints.append(
+            "JSON 대신 HTML이 반환됨 — 보안 플러그인(Wordfence 등)·방화벽·"
+            "Cloudflare 차단 페이지이거나 REST API가 비활성화됐을 수 있습니다"
+        )
+    if "wp-login" in body or "로그인" in body[:500]:
+        hints.append("로그인 페이지로 보임 — WP_USERNAME / 애플리케이션 비밀번호를 확인하세요")
+
+    raise RuntimeError(
+        f"{label} 응답을 JSON으로 읽지 못했습니다 "
+        f"(HTTP {r.status_code}, Content-Type={ctype or '없음'}).\n"
+        f"  원인 추정: {' / '.join(hints) if hints else '알 수 없음'}\n"
+        f"  응답 앞부분: {body[:300] or '(빈 응답)'}"
+    )
+
+
 def wp_upload_media(local_path: str, title: str, alt: str,
                     caption: str, description: str) -> dict:
     fname = os.path.basename(local_path)
     encoded = requests.utils.quote(fname)
     with open(local_path, "rb") as f:
         body = f.read()
+    check_wp_config()
     headers = {
+        **WP_COMMON_HEADERS,
         "Content-Disposition": f"attachment; filename*=UTF-8''{encoded}",
         "Content-Type": "image/webp",
     }
@@ -279,12 +345,16 @@ def wp_upload_media(local_path: str, title: str, alt: str,
         f"{WP_URL}/wp-json/wp/v2/media",
         headers=headers, data=body, auth=wp_auth(), timeout=240,
     )
-    r.raise_for_status()
-    j = r.json()
+    if r.status_code >= 400:
+        raise RuntimeError(
+            f"워드프레스 미디어 업로드 실패 (HTTP {r.status_code}): {(r.text or '')[:300]}"
+        )
+    j = safe_json(r, "워드프레스 미디어 업로드")
     media_id = j["id"]
     # 메타 업데이트 (alt/caption/description은 별도 PATCH)
     r2 = requests.post(
         f"{WP_URL}/wp-json/wp/v2/media/{media_id}",
+        headers=WP_COMMON_HEADERS,
         json={
             "title": title,
             "alt_text": alt,
@@ -298,29 +368,47 @@ def wp_upload_media(local_path: str, title: str, alt: str,
 
 
 def wp_create_post(payload: dict) -> dict:
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    }
-    
-    # json=payload 처리를 하면 requests 라이브러리가 헤더와 인코딩을 서버 규격에 맞게 자동 연산합니다.
-    r = requests.post(
-        f"{WP_URL}/wp-json/wp/v2/posts/",
-        headers=headers,
-        json=payload,  # 수동 직렬화 대신 내장 자동 포맷 적용
-        auth=wp_auth(), 
-        timeout=60,
-    )
-    r.raise_for_status()
-    return r.json()
+    check_wp_config()
+
+    # ※ 끝 슬래시(/posts/)는 워드프레스 정규화 리다이렉트를 유발할 수 있고,
+    #   POST가 리다이렉트되면 본문이 사라진 채 HTML 페이지가 돌아와 JSON 파싱이 깨집니다.
+    url = f"{WP_URL}/wp-json/wp/v2/posts"
+
+    last_err = None
+    for attempt in range(1, 4):
+        try:
+            # json=payload 처리를 하면 requests 라이브러리가 헤더와 인코딩을 서버 규격에 맞게 자동 연산합니다.
+            r = requests.post(
+                url,
+                headers=WP_COMMON_HEADERS,
+                json=payload,  # 수동 직렬화 대신 내장 자동 포맷 적용
+                auth=wp_auth(),
+                timeout=120,
+            )
+            if r.status_code >= 400:
+                raise RuntimeError(
+                    f"워드프레스 글 생성 실패 (HTTP {r.status_code}): {(r.text or '')[:300]}"
+                )
+            return safe_json(r, "워드프레스 글 생성")
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            last_err = e
+            print(f"  ~ 워드프레스 연결 실패(시도 {attempt}/3) — {attempt * 3}초 후 재시도")
+            time.sleep(attempt * 3)
+
+    raise RuntimeError(f"워드프레스 연결 실패 (3회 재시도 후 포기): {last_err}")
 
 
 def wp_get_post(post_id: int) -> dict:
     r = requests.get(
         f"{WP_URL}/wp-json/wp/v2/posts/{post_id}?context=edit",
-        auth=wp_auth(), timeout=30,
+        headers=WP_COMMON_HEADERS,
+        auth=wp_auth(), timeout=60,
     )
-    r.raise_for_status()
-    return r.json()
+    if r.status_code >= 400:
+        raise RuntimeError(
+            f"워드프레스 글 조회 실패 (HTTP {r.status_code}): {(r.text or '')[:300]}"
+        )
+    return safe_json(r, "워드프레스 글 조회")
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -668,13 +756,21 @@ def generate_ai_content(focus_kw: str, lsi: list, content_type: str,
     if resp.status_code != 200:
         raise RuntimeError(f"Claude API 오류 {resp.status_code}: {resp.text[:300]}")
 
-    raw = resp.json()["content"][0]["text"]
+    raw = safe_json(resp, "Claude API")["content"][0]["text"]
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
         # 마크다운 코드블록이 붙어 올 경우 제거 후 재시도
         clean = re.sub(r"```(?:json)?|```", "", raw).strip()
-        data = json.loads(clean)
+        try:
+            data = json.loads(clean)
+        except json.JSONDecodeError as e:
+            # 그래도 실패하면 본문 앞부분을 보여줘 원인을 알 수 있게 함
+            raise RuntimeError(
+                "Claude가 반환한 콘텐츠를 JSON으로 파싱하지 못했습니다 "
+                f"(max_tokens 초과로 잘렸을 가능성). 오류: {e}\n"
+                f"  응답 앞부분: {clean[:300]}"
+            ) from None
 
     preview_title = str(data.get("title", ""))[:40]
     print(f"  ✓ Claude 생성 완료 — TITLE 미리보기: {preview_title}…")
