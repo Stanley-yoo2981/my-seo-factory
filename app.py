@@ -285,6 +285,29 @@ st.markdown("""
         font-weight: 500 !important;
     }
 
+    /* ── 라디오/체크박스 선택지 글자색 고정 ──
+       옵션 텍스트는 <p> 안에 들어가는데, 부모 div에만 색을 주면
+       Streamlit 기본 테마의 <p> 색상(다크모드 = 흰색)이 이겨서
+       밝은 배경에 흰 글씨가 되어 보이지 않습니다. <p>를 직접 지정합니다. */
+    [data-testid="stRadio"] label p,
+    [data-testid="stRadio"] label div,
+    [data-testid="stRadio"] [data-testid="stMarkdownContainer"] p,
+    [data-baseweb="radio"] p,
+    [data-baseweb="radio"] [data-testid="stMarkdownContainer"] p,
+    [data-testid="stCheckbox"] label p,
+    [data-testid="stCheckbox"] [data-testid="stMarkdownContainer"] p {
+        color: #3a3050 !important;
+        font-weight: 500 !important;
+        opacity: 1 !important;
+    }
+
+    /* 선택된 항목은 조금 더 진하게 */
+    [data-testid="stRadio"] label[aria-checked="true"] p,
+    [data-baseweb="radio"][aria-checked="true"] p {
+        color: #241c3a !important;
+        font-weight: 700 !important;
+    }
+
     /* ── 셀렉트박스 ── */
     [data-testid="stSelectbox"] > div {
         background: rgba(255,255,255,0.55) !important;

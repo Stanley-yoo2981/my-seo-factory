@@ -1,0 +1,12 @@
+# 앱 배경이 밝은 글래스모피즘 스타일로 고정돼 있으므로 테마도 light 로 고정합니다.
+# (고정하지 않으면 보는 사람의 OS 다크모드를 따라가서 글자가 흰색이 되어 안 보입니다.)
+[theme]
+base = "light"
+primaryColor = "#5c4f8a"
+backgroundColor = "#faf7fb"
+secondaryBackgroundColor = "#f3eef7"
+textColor = "#3a3050"
+font = "sans serif"
+
+[client]
+toolbarMode = "minimal"
