@@ -237,6 +237,37 @@ def fetch_naver_news(keyword: str) -> list:
     return results
 
 
+def safe_json(r, label: str):
+    """
+    응답을 JSON으로 파싱하되, JSON이 아니면 원인을 알 수 있는 메시지로 바꿔 던집니다.
+    (requests의 기본 에러는 'Expecting value: line 1 column 1' 만 던져 원인 파악이 불가능합니다.)
+    DALL-E / Claude API 등 requests로 호출하는 모든 외부 API 응답 파싱에 공용으로 씁니다.
+    """
+    ctype = r.headers.get("Content-Type", "")
+    body = (r.text or "").strip()
+
+    try:
+        return r.json()
+    except ValueError:
+        pass
+
+    hints = []
+    if r.history:
+        chain = " → ".join(str(h.status_code) for h in r.history)
+        hints.append(f"리다이렉트 발생({chain} → {r.url})")
+    if not body:
+        hints.append("응답 본문이 비어 있음 — 요청이 중간에 끊겼을 수 있습니다")
+    elif "text/html" in ctype or body[:1] == "<":
+        hints.append("JSON 대신 HTML이 반환됨 — 차단 페이지이거나 엔드포인트가 잘못됐을 수 있습니다")
+
+    raise RuntimeError(
+        f"{label} 응답을 JSON으로 읽지 못했습니다 "
+        f"(HTTP {r.status_code}, Content-Type={ctype or '없음'}).\n"
+        f"  원인 추정: {' / '.join(hints) if hints else '알 수 없음'}\n"
+        f"  응답 앞부분: {body[:300] or '(빈 응답)'}"
+    )
+
+
 # ──────────────────────────────────────────────────────────────────
 # 2. DALL-E 3 이미지 생성
 # ──────────────────────────────────────────────────────────────────
