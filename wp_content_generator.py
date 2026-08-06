@@ -51,7 +51,13 @@ WP_URL = os.getenv("WP_URL", "").rstrip("/")
 WP_SSH_HOST           = os.getenv("WP_SSH_HOST", "")
 WP_SSH_PORT           = int(os.getenv("WP_SSH_PORT", "22") or "22")
 WP_SSH_USER           = os.getenv("WP_SSH_USER", "")
-WP_SSH_PRIVATE_KEY    = os.getenv("WP_SSH_PRIVATE_KEY", "")   # PEM 텍스트 그대로
+# 개인키는 두 가지 방식을 지원합니다.
+#  - WP_SSH_PRIVATE_KEY_B64 (권장): 키 파일 전체를 base64 한 줄로 인코딩한 값.
+#    Streamlit Secrets 편집기 등이 여러 줄 텍스트를 자동 들여쓰기하면서
+#    PEM 형식이 깨지는 문제(줄마다 공백 삽입 등)를 원천적으로 피할 수 있습니다.
+#  - WP_SSH_PRIVATE_KEY: PEM 텍스트를 그대로 저장 (하위 호환용, 형식이 깨지기 쉬움).
+WP_SSH_PRIVATE_KEY_B64 = os.getenv("WP_SSH_PRIVATE_KEY_B64", "")
+WP_SSH_PRIVATE_KEY    = os.getenv("WP_SSH_PRIVATE_KEY", "")
 WP_SSH_KEY_PASSPHRASE = os.getenv("WP_SSH_KEY_PASSPHRASE") or None
 WP_REMOTE_PATH        = os.getenv("WP_REMOTE_PATH", "").rstrip("/")  # 서버 내 WP 설치 경로 (wp-cli --path)
 
@@ -315,15 +321,31 @@ def check_ssh_config():
         name for name, val in (
             ("WP_SSH_HOST", WP_SSH_HOST),
             ("WP_SSH_USER", WP_SSH_USER),
-            ("WP_SSH_PRIVATE_KEY", WP_SSH_PRIVATE_KEY),
             ("WP_REMOTE_PATH", WP_REMOTE_PATH),
         ) if not val
     ]
+    if not WP_SSH_PRIVATE_KEY_B64 and not WP_SSH_PRIVATE_KEY:
+        missing.append("WP_SSH_PRIVATE_KEY_B64 (또는 WP_SSH_PRIVATE_KEY)")
     if missing:
         raise RuntimeError(
             f"SSH 발행 환경변수 누락: {', '.join(missing)} — "
-            "Streamlit Secrets에 등록하세요 (WP_SSH_HOST/WP_SSH_USER/WP_SSH_PRIVATE_KEY/WP_REMOTE_PATH)."
+            "Streamlit Secrets에 등록하세요."
         )
+
+
+def _resolve_ssh_key_text() -> str:
+    """
+    base64 인코딩본(WP_SSH_PRIVATE_KEY_B64)을 우선 사용합니다.
+    Streamlit Secrets 편집기 등에서 여러 줄 PEM 텍스트를 저장할 때 줄마다
+    공백이 섞이거나 줄바꿈이 깨지는 문제가 흔한데, base64는 한 줄이라 이 문제가
+    구조적으로 발생하지 않습니다.
+    """
+    if WP_SSH_PRIVATE_KEY_B64:
+        try:
+            return base64.b64decode(WP_SSH_PRIVATE_KEY_B64).decode("utf-8")
+        except Exception as e:
+            raise RuntimeError(f"WP_SSH_PRIVATE_KEY_B64 base64 디코딩 실패: {e}") from e
+    return WP_SSH_PRIVATE_KEY
 
 
 def _load_ssh_key(key_text: str, passphrase: str = None):
@@ -347,15 +369,17 @@ def _load_ssh_key(key_text: str, passphrase: str = None):
         except Exception as e:
             last_err = e
     raise RuntimeError(
-        f"SSH 개인키를 읽지 못했습니다 (지원 형식: Ed25519/RSA/ECDSA/DSS). "
-        f"WP_SSH_PRIVATE_KEY 값이 -----BEGIN...----- 로 시작하는 PEM 전체인지 확인하세요. "
-        f"원인: {last_err}"
+        "SSH 개인키를 읽지 못했습니다 (지원 형식: Ed25519/RSA/ECDSA/DSS). "
+        "WP_SSH_PRIVATE_KEY_B64를 쓰는 경우 base64 인코딩이 올바른지, "
+        "WP_SSH_PRIVATE_KEY(PEM 원문)를 쓰는 경우 각 줄 앞에 공백이 섞이지 않았는지 "
+        f"확인하세요. 원인: {last_err}"
     )
 
 
 def _ssh_connect():
     check_ssh_config()
-    pkey = _load_ssh_key(WP_SSH_PRIVATE_KEY, WP_SSH_KEY_PASSPHRASE)
+    key_text = _resolve_ssh_key_text()
+    pkey = _load_ssh_key(key_text, WP_SSH_KEY_PASSPHRASE)
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     try:
