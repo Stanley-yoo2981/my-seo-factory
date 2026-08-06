@@ -389,7 +389,24 @@ def wp_create_post(payload: dict) -> dict:
                 raise RuntimeError(
                     f"워드프레스 글 생성 실패 (HTTP {r.status_code}): {(r.text or '')[:300]}"
                 )
-            return safe_json(r, "워드프레스 글 생성")
+            data = safe_json(r, "워드프레스 글 생성")
+
+            # 정상 응답이면 반드시 글 ID가 들어 있습니다.
+            # 없으면 워드프레스가 오류 객체를 200으로 돌려준 경우이므로
+            # KeyError 대신 실제 사유(code/message)를 보여줍니다.
+            if not isinstance(data, dict) or "id" not in data:
+                if isinstance(data, dict) and data.get("code"):
+                    raise RuntimeError(
+                        f"워드프레스가 글 생성을 거부했습니다 — "
+                        f"code={data.get('code')}, message={data.get('message')}\n"
+                        f"  (권한/애플리케이션 비밀번호 또는 보안 플러그인 설정을 확인하세요)"
+                    )
+                raise RuntimeError(
+                    "워드프레스 응답에 글 ID('id')가 없습니다. "
+                    f"받은 형식: {type(data).__name__}, "
+                    f"내용 앞부분: {str(data)[:300]}"
+                )
+            return data
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
             last_err = e
             print(f"  ~ 워드프레스 연결 실패(시도 {attempt}/3) — {attempt * 3}초 후 재시도")
@@ -904,11 +921,22 @@ def build_html(
         )
 
     # ── 목차 (ToC) — AI 생성 toc_items 활용
-    toc_items = ai.get("toc_items") or []
-    if toc_items:
+    # AI가 키 이름을 다르게 반환할 수 있으므로 방어적으로 읽습니다.
+    # (기존에는 item["id"] 직접 접근이라 키가 없으면 KeyError로 죽었습니다.)
+    toc_pairs = []
+    for i, item in enumerate(ai.get("toc_items") or []):
+        if isinstance(item, str):
+            anchor, label = f"sec{i + 1}", item
+        else:
+            anchor = item.get("id") or item.get("anchor") or f"sec{i + 1}"
+            label  = item.get("label") or item.get("title") or item.get("text") or ""
+        if label:
+            toc_pairs.append((anchor, label))
+
+    if toc_pairs:
         toc_li = "".join(
-            f'<li><a href="#{item["id"]}" style="color:#2b6cb0; text-decoration:none;">{item["label"]}</a></li>'
-            for item in toc_items
+            f'<li><a href="#{anchor}" style="color:#2b6cb0; text-decoration:none;">{label}</a></li>'
+            for anchor, label in toc_pairs
         )
         parts.append(
             f'<nav style="{TOC_BOX}" aria-label="목차">'

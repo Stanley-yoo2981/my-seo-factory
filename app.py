@@ -401,8 +401,14 @@ def run_factory_script(filename, *args):
         status_text  = st.empty()
         LOG_PATTERN  = re.compile(r"\[(\d+(?:\.\d+)?)/(\d+)\]\s*(.+)")
 
+        # 전체 로그를 보관해 실패 시 트레이스백 원문(파일·줄번호 포함)을 보여줍니다.
+        # (기존에는 'Error'가 포함된 줄만 출력해서 정작 어디서 터졌는지 알 수 없었습니다.)
+        all_lines   = []
+        last_step   = ""
+
         for line in proc.stdout:
             stripped = line.strip()
+            all_lines.append(line.rstrip("\n"))
             if any(kw in stripped for kw in ("Traceback", "Error", "Exception")):
                 st.error(stripped)
                 continue
@@ -411,6 +417,7 @@ def run_factory_script(filename, *args):
                 current   = float(m.group(1))
                 total     = int(m.group(2))
                 task_name = m.group(3).strip()
+                last_step = f"[{current:g}/{total}] {task_name}"
                 pct = min(current / total, 1.0)
                 progress_bar.progress(pct)
                 status_text.markdown(
@@ -459,9 +466,16 @@ def run_factory_script(filename, *args):
                 "font-weight:700;"
                 "color:#b83232;"
                 "display:inline-block;'>"
-                "❌ &nbsp;오류가 발생했습니다. 위 에러 메시지를 확인하세요.</div>",
+                "❌ &nbsp;오류가 발생했습니다. 아래 상세 로그를 확인하세요.</div>",
                 unsafe_allow_html=True,
             )
+            if last_step:
+                st.error(f"❌ 실패 지점: {last_step}")
+            # 트레이스백 원문 전체를 그대로 노출 — 어느 파일 몇 번째 줄에서
+            # 터졌는지 확인할 수 있어야 원인을 특정할 수 있습니다.
+            if all_lines:
+                with st.expander("🔎 실행 로그 전체 보기 (오류 원인 확인)", expanded=True):
+                    st.code("\n".join(all_lines[-60:]), language="text")
         return proc.returncode
 
     except Exception as e:
