@@ -27,7 +27,10 @@ import re
 import argparse
 import sys
 from datetime import datetime
+import shlex
 import requests
+import paramiko
+from io import StringIO
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from PIL import Image
@@ -40,8 +43,17 @@ load_dotenv(os.path.join(PROJECT_DIR, ".env"))
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 WP_URL = os.getenv("WP_URL", "").rstrip("/")
-WP_USERNAME = os.getenv("WP_USERNAME")
-WP_PASSWORD = os.getenv("WP_PASSWORD", "").replace(" ", "")
+
+# ── SSH 기반 발행(WP-CLI) 설정 ──
+# Imunify360 등 서버 방화벽이 REST API(HTTP) 요청을 봇으로 오인해 차단하는 문제를
+# 피하기 위해, HTTP REST API 대신 SSH로 접속해 워드프레스 서버에 내장된 WP-CLI를
+# 직접 실행하는 방식으로 발행합니다 (방화벽의 HTTP 검사 계층을 아예 거치지 않음).
+WP_SSH_HOST           = os.getenv("WP_SSH_HOST", "")
+WP_SSH_PORT           = int(os.getenv("WP_SSH_PORT", "22") or "22")
+WP_SSH_USER           = os.getenv("WP_SSH_USER", "")
+WP_SSH_PRIVATE_KEY    = os.getenv("WP_SSH_PRIVATE_KEY", "")   # PEM 텍스트 그대로
+WP_SSH_KEY_PASSPHRASE = os.getenv("WP_SSH_KEY_PASSPHRASE") or None
+WP_REMOTE_PATH        = os.getenv("WP_REMOTE_PATH", "").rstrip("/")  # 서버 내 WP 설치 경로 (wp-cli --path)
 
 CSV_PATH = os.path.join(PROJECT_DIR, "keywords.csv")
 IMG_DIR = os.path.join(PROJECT_DIR, "images")
@@ -259,173 +271,183 @@ def to_webp(png_bytes: bytes, out_path: str):
 
 
 # ──────────────────────────────────────────────────────────────────
-# 3. WordPress REST API 클라이언트
+# 3. WordPress 발행 클라이언트 — SSH + WP-CLI
+#
+#    Imunify360 등 서버 보안 플러그인이 REST API(HTTP) 요청을 자동화 봇으로
+#    간주해 차단하는 문제가 있어(요청 IP가 매번 바뀌는 클라우드 자동화 환경이라
+#    IP 화이트리스트로도 근본 해결이 안 됨), REST API를 아예 쓰지 않고
+#    SSH로 서버에 직접 접속해 워드프레스 내장 WP-CLI 명령을 실행하는 방식으로
+#    전환했습니다. HTTP 계층을 거치지 않으므로 해당 방화벽 규칙의 영향을 받지 않습니다.
 # ──────────────────────────────────────────────────────────────────
-def wp_auth():
-    return (WP_USERNAME, WP_PASSWORD)
-
-
-# 워드프레스/외부 API 공통 헤더 — Accept를 명시해야 일부 보안플러그인/WAF가
-# HTML 차단 페이지 대신 정상 JSON을 돌려줍니다.
-WP_COMMON_HEADERS = {
-    "Accept": "application/json",
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-}
-
-
-def check_wp_config():
-    """WP 접속 정보 누락 시 조용히 HTML 로그인 페이지를 받아 JSON 파싱에서 죽는 것을 방지."""
+def check_ssh_config():
     missing = [
         name for name, val in (
-            ("WP_URL", WP_URL),
-            ("WP_USERNAME", WP_USERNAME),
-            ("WP_PASSWORD", WP_PASSWORD),
+            ("WP_SSH_HOST", WP_SSH_HOST),
+            ("WP_SSH_USER", WP_SSH_USER),
+            ("WP_SSH_PRIVATE_KEY", WP_SSH_PRIVATE_KEY),
+            ("WP_REMOTE_PATH", WP_REMOTE_PATH),
         ) if not val
     ]
     if missing:
         raise RuntimeError(
-            f"워드프레스 환경변수 누락: {', '.join(missing)} — "
-            "Streamlit Secrets 또는 .env 에 등록하세요."
+            f"SSH 발행 환경변수 누락: {', '.join(missing)} — "
+            "Streamlit Secrets에 등록하세요 (WP_SSH_HOST/WP_SSH_USER/WP_SSH_PRIVATE_KEY/WP_REMOTE_PATH)."
         )
 
 
-def safe_json(r, label: str):
-    """
-    응답을 JSON으로 파싱하되, JSON이 아니면 원인을 알 수 있는 메시지로 바꿔 던집니다.
-    (기존에는 requests가 'Expecting value: line 1 column 1' 만 던져 원인 파악이 불가능했습니다.)
-    """
-    ctype = r.headers.get("Content-Type", "")
-    body = (r.text or "").strip()
-
-    try:
-        return r.json()
-    except ValueError:
-        pass
-
-    # 원인 진단 메시지 구성
-    hints = []
-    if r.history:
-        chain = " → ".join(str(h.status_code) for h in r.history)
-        hints.append(f"리다이렉트 발생({chain} → {r.url}) — WP_URL의 http/https·www 설정을 확인하세요")
-    if not body:
-        hints.append("응답 본문이 비어 있음 — 서버(PHP)가 요청을 중단했을 수 있습니다")
-    elif "text/html" in ctype or body[:1] == "<":
-        hints.append(
-            "JSON 대신 HTML이 반환됨 — 보안 플러그인(Wordfence 등)·방화벽·"
-            "Cloudflare 차단 페이지이거나 REST API가 비활성화됐을 수 있습니다"
-        )
-    if "wp-login" in body or "로그인" in body[:500]:
-        hints.append("로그인 페이지로 보임 — WP_USERNAME / 애플리케이션 비밀번호를 확인하세요")
-
+def _load_ssh_key(key_text: str, passphrase: str = None):
+    """PEM 형식 개인키 문자열을 키 종류(Ed25519/RSA/ECDSA/DSS) 자동판별하여 로드합니다."""
+    key_classes = [paramiko.Ed25519Key, paramiko.RSAKey, paramiko.ECDSAKey, paramiko.DSSKey]
+    last_err = None
+    for cls in key_classes:
+        try:
+            return cls.from_private_key(StringIO(key_text), password=passphrase)
+        except Exception as e:
+            last_err = e
     raise RuntimeError(
-        f"{label} 응답을 JSON으로 읽지 못했습니다 "
-        f"(HTTP {r.status_code}, Content-Type={ctype or '없음'}).\n"
-        f"  원인 추정: {' / '.join(hints) if hints else '알 수 없음'}\n"
-        f"  응답 앞부분: {body[:300] or '(빈 응답)'}"
+        f"SSH 개인키를 읽지 못했습니다 (지원 형식: Ed25519/RSA/ECDSA/DSS). "
+        f"WP_SSH_PRIVATE_KEY 값이 -----BEGIN...----- 로 시작하는 PEM 전체인지 확인하세요. "
+        f"원인: {last_err}"
     )
+
+
+def _ssh_connect():
+    check_ssh_config()
+    pkey = _load_ssh_key(WP_SSH_PRIVATE_KEY, WP_SSH_KEY_PASSPHRASE)
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        client.connect(
+            hostname=WP_SSH_HOST,
+            port=WP_SSH_PORT,
+            username=WP_SSH_USER,
+            pkey=pkey,
+            timeout=20,
+            banner_timeout=20,
+            auth_timeout=20,
+            look_for_keys=False,
+            allow_agent=False,
+        )
+    except Exception as e:
+        raise RuntimeError(
+            f"SSH 접속 실패 ({WP_SSH_USER}@{WP_SSH_HOST}:{WP_SSH_PORT}): {e}\n"
+            "  Cloudways 애플리케이션의 SSH 접속 정보(호스트/포트/사용자)와 "
+            "등록한 공개키가 일치하는지 확인하세요."
+        ) from e
+    return client
+
+
+def _run_wp_cli(client, args: list, input_text: str = None, input_bytes: bytes = None):
+    """
+    WP-CLI 명령을 --path=WP_REMOTE_PATH 로 원격 실행합니다.
+    본문(HTML)처럼 셸 인자로 넘기기 위험한 긴 텍스트는 '-' (STDIN) 로 전달합니다.
+    """
+    cmd = "wp " + " ".join(shlex.quote(a) for a in args) + f" --path={shlex.quote(WP_REMOTE_PATH)}"
+    stdin, stdout, stderr = client.exec_command(cmd, timeout=180)
+
+    if input_bytes is not None:
+        stdin.write(input_bytes)
+        stdin.channel.shutdown_write()
+    elif input_text is not None:
+        stdin.write(input_text.encode("utf-8"))
+        stdin.channel.shutdown_write()
+
+    out = stdout.read().decode("utf-8", errors="replace").strip()
+    err = stderr.read().decode("utf-8", errors="replace").strip()
+    exit_code = stdout.channel.recv_exit_status()
+    if exit_code != 0:
+        raise RuntimeError(f"WP-CLI 명령 실패 (exit={exit_code}): {err or out}\n  명령: {cmd}")
+    return out
 
 
 def wp_upload_media(local_path: str, title: str, alt: str,
                     caption: str, description: str) -> dict:
-    fname = os.path.basename(local_path)
-    encoded = requests.utils.quote(fname)
-    with open(local_path, "rb") as f:
-        body = f.read()
-    check_wp_config()
-    headers = {
-        **WP_COMMON_HEADERS,
-        "Content-Disposition": f"attachment; filename*=UTF-8''{encoded}",
-        "Content-Type": "image/webp",
-    }
-    r = requests.post(
-        f"{WP_URL}/wp-json/wp/v2/media",
-        headers=headers, data=body, auth=wp_auth(), timeout=240,
-    )
-    if r.status_code >= 400:
-        raise RuntimeError(
-            f"워드프레스 미디어 업로드 실패 (HTTP {r.status_code}): {(r.text or '')[:300]}"
-        )
-    j = safe_json(r, "워드프레스 미디어 업로드")
-    media_id = j["id"]
-    # 메타 업데이트 (alt/caption/description은 별도 PATCH)
-    r2 = requests.post(
-        f"{WP_URL}/wp-json/wp/v2/media/{media_id}",
-        headers=WP_COMMON_HEADERS,
-        json={
-            "title": title,
-            "alt_text": alt,
-            "caption": caption,
-            "description": description,
-        },
-        auth=wp_auth(), timeout=60,
-    )
-    r2.raise_for_status()
-    return {"id": media_id, "url": j.get("source_url", ""), "slug": j.get("slug", "")}
+    remote_tmp = f"/tmp/{os.path.basename(local_path)}"
+    client = _ssh_connect()
+    try:
+        sftp = client.open_sftp()
+        try:
+            sftp.put(local_path, remote_tmp)
+        finally:
+            sftp.close()
+
+        media_id = _run_wp_cli(client, [
+            "media", "import", remote_tmp,
+            f"--title={title}",
+            f"--alt={alt}",
+            f"--caption={caption}",
+            f"--desc={description}",
+            "--porcelain",
+        ])
+        media_id = int(media_id.strip().splitlines()[-1])
+
+        url = _run_wp_cli(client, [
+            "post", "list", "--post_type=attachment",
+            f"--post__in={media_id}", "--field=url",
+        ])
+
+        # 서버에 남긴 임시 업로드 파일 정리 (실패해도 발행 자체는 계속 진행)
+        try:
+            client.exec_command(f"rm -f {shlex.quote(remote_tmp)}")
+        except Exception:
+            pass
+
+        return {"id": media_id, "url": url.strip(), "slug": ""}
+    finally:
+        client.close()
 
 
 def wp_create_post(payload: dict) -> dict:
-    check_wp_config()
+    client = _ssh_connect()
+    try:
+        args = [
+            "post", "create", "-",  # '-' = 본문(content)을 STDIN에서 읽음
+            f"--post_title={payload['title']}",
+            f"--post_name={payload['slug']}",
+            f"--post_status={payload['status']}",
+            f"--post_excerpt={payload['excerpt']}",
+            "--porcelain",
+        ]
+        out = _run_wp_cli(client, args, input_text=payload["content"])
+        post_id_lines = [l for l in out.splitlines() if l.strip().isdigit()]
+        if not post_id_lines:
+            raise RuntimeError(f"워드프레스가 글 ID를 반환하지 않았습니다. WP-CLI 출력: {out[:300]}")
+        post_id = int(post_id_lines[-1])
 
-    # ※ 끝 슬래시(/posts/)는 워드프레스 정규화 리다이렉트를 유발할 수 있고,
-    #   POST가 리다이렉트되면 본문이 사라진 채 HTML 페이지가 돌아와 JSON 파싱이 깨집니다.
-    url = f"{WP_URL}/wp-json/wp/v2/posts"
+        # RankMath 메타 필드 적용
+        for key, value in (payload.get("meta") or {}).items():
+            _run_wp_cli(client, ["post", "meta", "update", str(post_id), key, value])
 
-    last_err = None
-    for attempt in range(1, 4):
-        try:
-            # json=payload 처리를 하면 requests 라이브러리가 헤더와 인코딩을 서버 규격에 맞게 자동 연산합니다.
-            r = requests.post(
-                url,
-                headers=WP_COMMON_HEADERS,
-                json=payload,  # 수동 직렬화 대신 내장 자동 포맷 적용
-                auth=wp_auth(),
-                timeout=120,
-            )
-            if r.status_code >= 400:
-                raise RuntimeError(
-                    f"워드프레스 글 생성 실패 (HTTP {r.status_code}): {(r.text or '')[:300]}"
-                )
-            data = safe_json(r, "워드프레스 글 생성")
+        # 대표 이미지(featured image) 연결 — WP 내부적으로 _thumbnail_id 메타와 동일
+        if payload.get("featured_media"):
+            _run_wp_cli(client, [
+                "post", "meta", "update", str(post_id),
+                "_thumbnail_id", str(payload["featured_media"]),
+            ])
 
-            # 정상 응답이면 반드시 글 ID가 들어 있습니다.
-            # 없으면 워드프레스가 오류 객체를 200으로 돌려준 경우이므로
-            # KeyError 대신 실제 사유(code/message)를 보여줍니다.
-            if not isinstance(data, dict) or "id" not in data:
-                if isinstance(data, dict) and data.get("code"):
-                    raise RuntimeError(
-                        f"워드프레스가 글 생성을 거부했습니다 — "
-                        f"code={data.get('code')}, message={data.get('message')}\n"
-                        f"  (권한/애플리케이션 비밀번호 또는 보안 플러그인 설정을 확인하세요)"
-                    )
-                raise RuntimeError(
-                    "워드프레스 응답에 글 ID('id')가 없습니다. "
-                    f"받은 형식: {type(data).__name__}, "
-                    f"내용 앞부분: {str(data)[:300]}"
-                )
-            return data
-        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
-            last_err = e
-            print(f"  ~ 워드프레스 연결 실패(시도 {attempt}/3) — {attempt * 3}초 후 재시도")
-            time.sleep(attempt * 3)
+        link = _run_wp_cli(client, [
+            "post", "list", "--post_status=any",
+            f"--post__in={post_id}", "--field=url",
+        ])
 
-    raise RuntimeError(f"워드프레스 연결 실패 (3회 재시도 후 포기): {last_err}")
+        return {"id": post_id, "link": link.strip(), "featured_media": payload.get("featured_media")}
+    finally:
+        client.close()
 
 
 def wp_get_post(post_id: int) -> dict:
-    r = requests.get(
-        f"{WP_URL}/wp-json/wp/v2/posts/{post_id}?context=edit",
-        headers=WP_COMMON_HEADERS,
-        auth=wp_auth(), timeout=60,
-    )
-    if r.status_code >= 400:
-        raise RuntimeError(
-            f"워드프레스 글 조회 실패 (HTTP {r.status_code}): {(r.text or '')[:300]}"
-        )
-    return safe_json(r, "워드프레스 글 조회")
+    client = _ssh_connect()
+    try:
+        keys = ["rank_math_focus_keyword", "rank_math_description", "rank_math_title"]
+        meta = {}
+        for key in keys:
+            try:
+                meta[key] = _run_wp_cli(client, ["post", "meta", "get", str(post_id), key])
+            except RuntimeError:
+                meta[key] = ""  # 메타가 아직 없는 경우 (RankMath 미설치 등)
+        return {"id": post_id, "meta": meta}
+    finally:
+        client.close()
 
 
 # ──────────────────────────────────────────────────────────────────
