@@ -339,10 +339,16 @@ def _ssh_connect():
 
 def _run_wp_cli(client, args: list, input_text: str = None, input_bytes: bytes = None):
     """
-    WP-CLI 명령을 --path=WP_REMOTE_PATH 로 원격 실행합니다.
+    WP-CLI 명령을 WP_REMOTE_PATH 에서 원격 실행합니다.
     본문(HTML)처럼 셸 인자로 넘기기 위험한 긴 텍스트는 '-' (STDIN) 로 전달합니다.
+
+    ※ --path= 옵션만으로는 부족합니다. 이 서버(Cloudways)의 wp-config.php가
+      require('wp-salt.php') 처럼 '상대경로'로 파일을 불러오는데, PHP는 이걸
+      프로세스의 현재 작업 디렉터리(cwd) 기준으로 찾습니다. SSH 세션의 기본 cwd는
+      워드프레스 루트가 아니므로, cd 로 먼저 이동한 뒤 wp를 실행해야 합니다.
     """
-    cmd = "wp " + " ".join(shlex.quote(a) for a in args) + f" --path={shlex.quote(WP_REMOTE_PATH)}"
+    wp_cmd = "wp " + " ".join(shlex.quote(a) for a in args) + f" --path={shlex.quote(WP_REMOTE_PATH)}"
+    cmd = f"cd {shlex.quote(WP_REMOTE_PATH)} && {wp_cmd}"
     stdin, stdout, stderr = client.exec_command(cmd, timeout=180)
 
     if input_bytes is not None:
